@@ -1,0 +1,1214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FLINK-STATEFUL-CLUSTER-CODI · Eviction Post-mortem</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0b0d;
+  --bg-2: #101216;
+  --surface: #13161b;
+  --surface-2: #181c23;
+  --border: #22262e;
+  --border-2: #2c313a;
+  --text: #e6e8ec;
+  --text-dim: #7a8290;
+  --text-faint: #4a5260;
+  --amber: #f5a623;
+  --amber-soft: rgba(245,166,35,0.12);
+  --red: #ff4d4f;
+  --red-soft: rgba(255,77,79,0.12);
+  --green: #3ddc84;
+  --green-soft: rgba(61,220,132,0.12);
+  --cyan: #67e8f9;
+  --violet: #a78bfa;
+  --grid-line: rgba(255,255,255,0.025);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body {
+  height: 100%; width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'IBM Plex Mono', 'Menlo', monospace;
+  font-size: 14px;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+body::before {
+  content: '';
+  position: fixed; inset: 0;
+  background-image:
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  background-size: 48px 48px;
+  pointer-events: none; z-index: 0;
+}
+body::after {
+  content: '';
+  position: fixed; inset: 0;
+  background: radial-gradient(ellipse at center, transparent 0%, rgba(0,0,0,0.65) 100%);
+  pointer-events: none; z-index: 1;
+}
+
+.frame { position: relative; z-index: 2; height: 100vh; display: grid; grid-template-rows: 1fr 44px; }
+
+.hud { display: flex; justify-content: space-between; align-items: center; padding: 0 24px; border-bottom: 1px solid var(--border); font-size: 11px; letter-spacing: 0.08em; color: var(--text-dim); text-transform: uppercase; background: rgba(10,11,13,0.75); backdrop-filter: blur(10px); }
+.hud-left, .hud-right { display: flex; align-items: center; gap: 14px; }
+.hud-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--red); box-shadow: 0 0 10px var(--red); animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.5; transform: scale(0.85); } }
+.hud-tag { padding: 3px 8px; border: 1px solid var(--border); font-size: 10px; letter-spacing: 0.14em; }
+.hud-tag.crit { color: var(--red); border-color: var(--red); }
+.hud-tag.muted { color: var(--text-faint); }
+
+.hud-bottom { display: flex; align-items: center; gap: 16px; padding: 0 24px; border-top: 1px solid var(--border); font-size: 10px; color: var(--text-faint); letter-spacing: 0.12em; text-transform: uppercase; background: rgba(10,11,13,0.75); backdrop-filter: blur(10px); }
+.progress { flex: 1; height: 2px; background: var(--border); position: relative; }
+.progress-fill { position: absolute; left: 0; top: 0; height: 100%; background: var(--amber); transition: width 380ms cubic-bezier(.4,0,.2,1); }
+.counter { color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.hint { display: flex; gap: 14px; }
+.hint kbd { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 18px; padding: 0 5px; border: 1px solid var(--border-2); font-size: 10px; background: var(--surface); color: var(--text-dim); margin-right: 4px; }
+
+.stage { position: relative; overflow: hidden; }
+.slide { position: absolute; inset: 0; padding: 36px 56px; opacity: 0; pointer-events: none; transition: opacity 360ms cubic-bezier(.4,0,.2,1); display: flex; flex-direction: column; }
+.slide.active { opacity: 1; pointer-events: auto; }
+
+.eyebrow { font-size: 11px; letter-spacing: 0.22em; color: var(--amber); text-transform: uppercase; font-weight: 500; }
+.eyebrow.red { color: var(--red); }
+.eyebrow.green { color: var(--green); }
+.eyebrow.cyan { color: var(--cyan); }
+
+h1.display { font-family: 'Instrument Serif', serif; font-style: italic; font-weight: 400; font-size: clamp(72px, 8.5vw, 132px); line-height: 0.95; letter-spacing: -0.02em; color: var(--text); }
+h1.display em { color: var(--amber); font-style: italic; }
+h2.section-title { font-family: 'IBM Plex Mono', monospace; font-size: 26px; font-weight: 500; letter-spacing: -0.01em; line-height: 1.2; color: var(--text); }
+h2.section-title .acc { color: var(--amber); }
+h2.section-title .red { color: var(--red); }
+h2.section-title .grn { color: var(--green); }
+
+/* ============= SLIDE 1: TITLE ============= */
+.title { align-items: center; justify-content: center; text-align: center; }
+.title .inner { max-width: 1020px; padding: 56px 72px; border: 1px solid var(--border); background: rgba(10,11,13,0.6); position: relative; }
+.title .corner { position: absolute; width: 12px; height: 12px; border: 1px solid var(--amber); }
+.title .corner.tl { top: -1px; left: -1px; border-right: none; border-bottom: none; }
+.title .corner.tr { top: -1px; right: -1px; border-left: none; border-bottom: none; }
+.title .corner.bl { bottom: -1px; left: -1px; border-right: none; border-top: none; }
+.title .corner.br { bottom: -1px; right: -1px; border-left: none; border-top: none; }
+.title .eyebrow { margin-bottom: 28px; }
+.title h1.display { margin-bottom: 28px; }
+.title .sub { font-size: 14px; color: var(--text-dim); letter-spacing: 0.04em; margin-bottom: 40px; }
+.title .meta-strip { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+.meta-chip { display: flex; flex-direction: column; gap: 6px; padding: 12px 18px; border: 1px solid var(--border); background: var(--surface); text-align: left; min-width: 130px; }
+.meta-chip .k { font-size: 9px; color: var(--text-faint); letter-spacing: 0.2em; text-transform: uppercase; }
+.meta-chip .v { font-size: 13px; color: var(--text); font-variant-numeric: tabular-nums; }
+.meta-chip .v.red { color: var(--red); }
+.meta-chip .v.amber { color: var(--amber); }
+
+/* ============= SLIDE 2: IMPACT ============= */
+.impact { justify-content: center; }
+.impact .grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: 64px; align-items: start; }
+.impact .lead .eyebrow { margin-bottom: 28px; }
+.impact h2.kill { font-family: 'IBM Plex Mono', monospace; font-size: clamp(48px, 6.4vw, 96px); font-weight: 700; line-height: 0.98; letter-spacing: -0.03em; margin-bottom: 32px; }
+.impact h2.kill .red { color: var(--red); }
+.impact h2.kill .strike { text-decoration: line-through; text-decoration-color: var(--red); text-decoration-thickness: 4px; }
+.impact .sub2 { font-size: 14px; color: var(--text-dim); line-height: 1.65; max-width: 580px; }
+.impact .sub2 .acc { color: var(--text); }
+.impact .sub2 .amber { color: var(--amber); }
+
+.impact .facts { display: flex; flex-direction: column; gap: 14px; }
+.impact .fact { border: 1px solid var(--border); background: var(--surface); padding: 18px 20px; display: flex; flex-direction: column; gap: 6px; position: relative; }
+.impact .fact::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 2px; background: var(--red); }
+.impact .fact.amber::before { background: var(--amber); }
+.impact .fact .k { font-size: 9px; color: var(--text-faint); letter-spacing: 0.2em; text-transform: uppercase; }
+.impact .fact .v { font-size: 22px; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+.impact .fact .v.red { color: var(--red); }
+.impact .fact .v.amber { color: var(--amber); }
+.impact .fact .note { font-size: 11px; color: var(--text-dim); line-height: 1.5; }
+
+/* ============= SLIDE 3: ROOT CAUSE ============= */
+.rootcause { gap: 28px; }
+.rootcause .rc-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+.rootcause .rc-card { border: 1px solid var(--border); background: var(--surface); padding: 28px; display: flex; flex-direction: column; gap: 14px; position: relative; }
+.rootcause .rc-card::before { content: ''; position: absolute; top: 0; left: 0; width: 48px; height: 2px; background: var(--amber); }
+.rootcause .rc-card.crit { border-color: rgba(255,77,79,0.45); }
+.rootcause .rc-card.crit::before { background: var(--red); }
+.rootcause .rc-card .rc-k { font-size: 10px; color: var(--text-faint); letter-spacing: 0.22em; text-transform: uppercase; }
+.rootcause .rc-card .rc-v { font-size: 60px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1; letter-spacing: -0.03em; margin: 4px 0; }
+.rootcause .rc-card .rc-v.amber { color: var(--amber); }
+.rootcause .rc-card .rc-v.red { color: var(--red); }
+.rootcause .rc-card .rc-v .u { font-size: 20px; color: var(--text-faint); margin-left: 4px; font-weight: 500; }
+.rootcause .rc-card .rc-note { font-size: 12px; color: var(--text-dim); line-height: 1.6; }
+.rootcause .rc-card .rc-note .acc { color: var(--red); font-weight: 600; }
+
+.rootcause .rc-explain { border: 1px solid var(--border); background: var(--surface); padding: 22px 28px; display: flex; flex-direction: column; gap: 16px; }
+.rootcause .rc-ex-row { display: grid; grid-template-columns: 140px 1fr; gap: 24px; align-items: start; }
+.rootcause .rc-ex-k { font-size: 10px; color: var(--text-faint); letter-spacing: 0.22em; text-transform: uppercase; padding-top: 4px; }
+.rootcause .rc-ex-v { font-size: 14px; color: var(--text); line-height: 1.7; font-variant-numeric: tabular-nums; }
+.rootcause .rc-ex-v .red { color: var(--red); font-weight: 600; }
+.rootcause .rc-ex-v .acc { color: var(--amber); font-weight: 600; }
+.rootcause .rc-ex-v .dim { color: var(--text-faint); }
+.rootcause .rc-ex-divider { height: 1px; background: var(--border-2); }
+
+/* ============= SLIDE 4: CLUSTER DIAGRAM ============= */
+.cluster { gap: 18px; }
+.cluster .head-row { display: flex; justify-content: space-between; align-items: flex-end; gap: 24px; }
+.cluster .lead { flex: 1; }
+.cluster .lead h2 { margin-top: 8px; }
+.cluster .time-box { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; padding: 10px 14px; border: 1px solid var(--border); background: var(--surface); min-width: 200px; }
+.cluster .time-box .k { font-size: 9px; color: var(--text-faint); letter-spacing: 0.2em; text-transform: uppercase; }
+.cluster .time-box .v { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--text); letter-spacing: 0.06em; }
+
+.cluster-diagram { display: flex; flex-direction: column; align-items: stretch; gap: 0; flex: 1; min-height: 0; justify-content: center; }
+
+.jm-box {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  padding: 18px 24px 18px 36px;
+  display: grid;
+  grid-template-columns: 1.6fr auto auto;
+  align-items: center;
+  gap: 36px;
+  position: relative;
+  transition: border-color 300ms, background 300ms;
+}
+.jm-box::before { content: ''; position: absolute; left: 14px; top: 50%; transform: translateY(-50%); width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 10px var(--green); transition: background 300ms, box-shadow 300ms; }
+.jm-box.failing { border-color: var(--red); background: var(--red-soft); }
+.jm-box.failing::before { background: var(--red); box-shadow: 0 0 10px var(--red); }
+.jm-box.recovery { border-color: var(--amber); background: var(--amber-soft); }
+.jm-box.recovery::before { background: var(--amber); box-shadow: 0 0 10px var(--amber); }
+.jm-box .col { display: flex; flex-direction: column; gap: 4px; }
+.jm-box .k { font-size: 9px; color: var(--text-faint); letter-spacing: 0.22em; text-transform: uppercase; }
+.jm-box .col-label { font-size: 9px; color: var(--text-faint); letter-spacing: 0.22em; text-transform: uppercase; }
+.jm-box .col-value { font-size: 16px; color: var(--text); font-weight: 600; letter-spacing: 0.02em; }
+.jm-box .jm-status .col-value { color: var(--green); transition: color 300ms; }
+.jm-box.failing .jm-status .col-value { color: var(--red); }
+.jm-box.recovery .jm-status .col-value { color: var(--amber); }
+.jm-box .jm-counter .col-value { font-size: 22px; font-variant-numeric: tabular-nums; }
+.jm-box .jm-counter .col-value .total { color: var(--text-faint); font-size: 14px; margin-left: 4px; }
+.jm-box.failing .jm-counter .col-value { color: var(--red); }
+
+.trunk { position: relative; height: 22px; display: flex; align-items: center; justify-content: center; }
+.trunk-line { width: 1px; height: 100%; background: var(--border-2); }
+.trunk-label { position: absolute; left: calc(50% + 12px); font-size: 9px; color: var(--text-faint); letter-spacing: 0.2em; text-transform: uppercase; white-space: nowrap; }
+
+.node-panel { border: 1px solid var(--border); background: var(--surface); padding: 18px 24px 18px 36px; display: grid; grid-template-columns: 1.4fr 2fr auto; align-items: center; gap: 28px; position: relative; transition: border-color 300ms, background 300ms; }
+.node-panel::before { content: ''; position: absolute; left: 14px; top: 50%; transform: translateY(-50%); width: 8px; height: 8px; background: var(--amber); transition: background 300ms; }
+.node-panel.crit { border-color: var(--red); background: var(--red-soft); }
+.node-panel.crit::before { background: var(--red); }
+.node-panel.healthy::before { background: var(--green); }
+.node-panel .nl { display: flex; flex-direction: column; gap: 4px; }
+.node-panel .nl .top { font-size: 13px; color: var(--text); letter-spacing: 0.04em; font-weight: 600; }
+.node-panel .nl .top .red { color: var(--red); }
+.node-panel .nl .top .grn { color: var(--green); }
+.node-panel .nl .sub { font-size: 10px; color: var(--text-faint); letter-spacing: 0.14em; text-transform: uppercase; }
+.node-panel .mem-track { position: relative; height: 22px; background: var(--bg-2); border: 1px solid var(--border-2); }
+.node-panel .mem-fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0%; background: var(--amber); }
+.node-panel .mem-over { position: absolute; left: 83.29%; top: 0; bottom: 0; width: 0%; background: repeating-linear-gradient(45deg, var(--red), var(--red) 4px, rgba(255,77,79,0.7) 4px, rgba(255,77,79,0.7) 8px); }
+.node-panel .mem-limit { position: absolute; left: 83.29%; top: -6px; bottom: -6px; width: 2px; background: var(--text); z-index: 3; }
+.node-panel .mem-limit-label { position: absolute; left: 83.29%; top: -16px; transform: translateX(-50%); font-size: 8px; color: var(--text); letter-spacing: 0.2em; text-transform: uppercase; white-space: nowrap; background: var(--surface); padding: 0 4px; z-index: 4; }
+.node-panel.crit .mem-limit-label { background: #1f1316; }
+.node-panel .mem-num { text-align: right; font-size: 18px; font-variant-numeric: tabular-nums; font-weight: 700; color: var(--amber); transition: color 300ms; min-width: 110px; letter-spacing: 0.02em; }
+.node-panel .mem-num.over { color: var(--red); }
+.node-panel .mem-num.healthy { color: var(--green); }
+.node-panel .mem-num .u { font-size: 11px; color: var(--text-faint); margin-left: 3px; font-weight: 500; }
+
+@keyframes shake { 0%, 100% { transform: translateX(0); } 20% { transform: translateX(-3px); } 40% { transform: translateX(3px); } 60% { transform: translateX(-2px); } 80% { transform: translateX(2px); } }
+.tm-cell.shaking { animation: shake 0.4s ease-in-out; background: rgba(255,77,79,0.25); border-color: var(--red); color: var(--red); }
+@keyframes flash { 0%, 100% { box-shadow: none; } 50% { box-shadow: 0 0 0 2px var(--red); } }
+.tm-cluster.flash { animation: flash 0.5s ease-in-out; }
+
+.tm-cluster { border: 1px solid var(--border); background: var(--surface); padding: 18px 22px; }
+.tm-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--border-2); }
+.tm-header .k { font-size: 10px; color: var(--text-faint); letter-spacing: 0.22em; text-transform: uppercase; }
+.tm-header .v { font-size: 11px; color: var(--text-dim); font-variant-numeric: tabular-nums; letter-spacing: 0.06em; }
+.tm-header .v .ok { color: var(--green); }
+.tm-header .v .bad { color: var(--red); }
+.tm-header .v .warn { color: var(--amber); }
+
+.tm-grid { display: grid; grid-template-columns: repeat(10, 1fr); gap: 5px; }
+.tm-cell {
+  height: 36px;
+  background: var(--bg-2);
+  border: 1px solid var(--border-2);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 10px; color: var(--text-faint);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.06em;
+  position: relative;
+  transition: background 200ms ease-out, border-color 200ms ease-out, color 200ms ease-out;
+}
+.tm-cell.healthy { background: rgba(61,220,132,0.08); border-color: rgba(61,220,132,0.5); color: var(--green); }
+.tm-cell.restarting { background: rgba(245,166,35,0.14); border-color: var(--amber); color: var(--amber); }
+.tm-cell.evicted { background: rgba(255,77,79,0.1); border-color: var(--red); color: var(--red); }
+.tm-cell.evicted::after { content: ''; position: absolute; left: 6px; right: 6px; top: 50%; height: 1px; background: var(--red); transform: translateY(-50%); }
+.tm-cell.gone { background: var(--bg-2); border-color: var(--border-2); color: var(--text-faint); opacity: 0.35; }
+.tm-cell.flagged { font-weight: 700; }
+
+.event-log {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  padding: 16px 22px;
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  transition: border-color 300ms;
+}
+.event-log.crit { border-color: var(--red); }
+.event-log.healthy { border-color: rgba(61,220,132,0.4); }
+.event-log .el-time { font-size: 18px; color: var(--amber); font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: 0.04em; flex-shrink: 0; min-width: 88px; transition: color 300ms; }
+.event-log.crit .el-time { color: var(--red); }
+.event-log.healthy .el-time { color: var(--green); }
+.event-log .el-msg { font-size: 13px; color: var(--text-dim); line-height: 1.5; }
+.event-log .el-msg .acc { color: var(--text); }
+.event-log .el-msg .red { color: var(--red); font-weight: 600; }
+.event-log .el-msg .amber { color: var(--amber); }
+
+.cluster-controls { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+.step-pips { display: flex; gap: 6px; }
+.step-pips .pip { width: 24px; height: 3px; background: var(--border); transition: background 300ms; }
+.step-pips .pip.done { background: var(--amber); }
+.step-pips .pip.current { background: var(--red); }
+.replay-btn { background: transparent; border: 1px solid var(--border); color: var(--text-dim); padding: 8px 14px; font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.18em; cursor: pointer; text-transform: uppercase; transition: border-color 200ms, color 200ms; }
+.replay-btn:hover { border-color: var(--amber); color: var(--amber); }
+
+/* ============= SLIDE 4: MATH ============= */
+.math { justify-content: center; align-items: center; gap: 22px; }
+.math .block { width: 100%; max-width: 900px; border: 1px solid var(--border); background: var(--surface); padding: 32px 44px; font-family: 'IBM Plex Mono', monospace; font-size: 17px; line-height: 1.85; position: relative; }
+.math .block::before { content: '> calc node_pressure --node node-α'; position: absolute; top: -12px; left: 20px; background: var(--bg); padding: 0 10px; font-size: 11px; color: var(--amber); letter-spacing: 0.06em; }
+.math .block .ln { display: flex; justify-content: space-between; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.math .block .ln .l { color: var(--text-dim); }
+.math .block .ln .l .lead-dot { color: var(--text-faint); }
+.math .block .ln .r { color: var(--text); }
+.math .block .ln .r.red { color: var(--red); font-weight: 600; }
+.math .block .ln .r.amber { color: var(--amber); font-weight: 600; }
+.math .block .ln.hr { border-top: 1px dashed var(--border-2); height: 0; line-height: 1; margin: 10px 0; }
+.math .block .ln.note { color: var(--text-faint); font-size: 13px; font-style: italic; padding-left: 20px; white-space: normal; }
+.math .block .ln.head { color: var(--amber); font-size: 11px; letter-spacing: 0.2em; text-transform: uppercase; margin-bottom: 8px; font-weight: 500; }
+.math .block .ln.total .l { color: var(--text); }
+
+.math .callout-big { max-width: 900px; width: 100%; border: 1px solid var(--red); background: var(--red-soft); padding: 22px 28px; display: flex; align-items: center; gap: 22px; }
+.math .callout-big .icon { font-family: 'Instrument Serif', serif; font-size: 60px; font-style: italic; color: var(--red); line-height: 1; }
+.math .callout-big .lines { display: flex; flex-direction: column; gap: 6px; }
+.math .callout-big .line1 { font-size: 11px; color: var(--text-dim); letter-spacing: 0.2em; text-transform: uppercase; }
+.math .callout-big .line2 { font-size: 22px; color: var(--text); font-weight: 500; line-height: 1.3; letter-spacing: -0.005em; }
+.math .callout-big .line2 .red { color: var(--red); font-weight: 700; }
+
+/* ============= SLIDE 5: FIX ============= */
+.fix { gap: 32px; }
+.fix .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 22px; flex: 1; min-height: 0; }
+.fix-card { border: 1px solid var(--border); background: var(--surface); padding: 26px; display: flex; flex-direction: column; gap: 16px; position: relative; }
+.fix-card::before { content: ''; position: absolute; top: 0; left: 0; width: 48px; height: 2px; background: var(--green); }
+.fix-card .ix { font-size: 10px; color: var(--green); letter-spacing: 0.22em; }
+.fix-card h3 { font-size: 17px; font-weight: 500; letter-spacing: 0.02em; text-transform: uppercase; }
+.fix-card .change { display: flex; align-items: baseline; gap: 14px; font-size: 30px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.fix-card .from { color: var(--text-faint); text-decoration: line-through; text-decoration-color: var(--red); }
+.fix-card .arrow { color: var(--green); font-size: 22px; }
+.fix-card .to { color: var(--green); }
+.fix-card .to .u, .fix-card .from .u { font-size: 15px; color: var(--text-faint); margin-left: 2px; }
+.fix-card .desc { font-size: 12px; color: var(--text-dim); line-height: 1.6; margin-top: auto; }
+.fix-card .desc .acc { color: var(--text); }
+
+/* ============= SLIDE 6: RESULT ============= */
+.result { gap: 24px; }
+.result .grid { flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 22px; min-height: 0; }
+.result .col { border: 1px solid var(--border); background: var(--surface); padding: 28px; display: flex; flex-direction: column; gap: 14px; position: relative; }
+.result .col.before { border-color: rgba(255,77,79,0.45); }
+.result .col.after { border-color: rgba(61,220,132,0.45); }
+.result .col::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px; }
+.result .col.before::before { background: var(--red); }
+.result .col.after::before { background: var(--green); }
+.result .col-head { display: flex; justify-content: space-between; align-items: center; padding-bottom: 14px; border-bottom: 1px solid var(--border-2); margin-bottom: 4px; }
+.result .col-head .t { font-size: 13px; letter-spacing: 0.2em; text-transform: uppercase; font-weight: 600; }
+.result .col.before .t { color: var(--red); }
+.result .col.after .t { color: var(--green); }
+.result .col-head .badge { font-size: 10px; padding: 3px 8px; letter-spacing: 0.14em; }
+.result .col.before .badge { border: 1px solid var(--red); color: var(--red); }
+.result .col.after .badge { border: 1px solid var(--green); color: var(--green); }
+.result .metric { display: flex; justify-content: space-between; align-items: baseline; padding: 8px 0; border-bottom: 1px dashed var(--border-2); }
+.result .metric .k { font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--text-dim); }
+.result .metric .v { font-size: 22px; font-variant-numeric: tabular-nums; font-weight: 500; color: var(--text); }
+.result .metric .v .u { font-size: 12px; color: var(--text-faint); margin-left: 2px; }
+.result .metric.hero { margin-top: auto; padding-top: 18px; border-top: 1px solid var(--border-2); border-bottom: none; align-items: flex-end; }
+.result .metric.hero .k { font-size: 11px; }
+.result .metric.hero .v { font-size: 64px; font-weight: 700; line-height: 1; letter-spacing: -0.03em; font-variant-numeric: tabular-nums; }
+.result .col.before .metric.hero .v { color: var(--red); }
+.result .col.after .metric.hero .v { color: var(--green); }
+
+/* ============= SLIDE 7: HA ARCHITECTURE ============= */
+.ha { gap: 18px; }
+.ha .head { display: flex; justify-content: space-between; align-items: flex-end; }
+.ha .head .eyebrow { color: var(--cyan); }
+.ha .head h2 { margin-top: 6px; max-width: 820px; }
+.ha-arch { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 14px; }
+
+.election-bar {
+  border: 1px solid var(--cyan);
+  background: rgba(103,232,249,0.06);
+  padding: 14px 22px 14px 36px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 24px;
+  position: relative;
+  transition: border-color 300ms, background 300ms;
+}
+.election-bar::before { content: ''; position: absolute; left: 14px; top: 50%; transform: translateY(-50%); width: 8px; height: 8px; border-radius: 50%; background: var(--cyan); box-shadow: 0 0 10px var(--cyan); transition: background 300ms, box-shadow 300ms; }
+.election-bar.electing { border-color: var(--amber); background: var(--amber-soft); }
+.election-bar.electing::before { background: var(--amber); box-shadow: 0 0 10px var(--amber); animation: pulse 0.8s ease-in-out infinite; }
+.election-bar .eb-left { display: flex; flex-direction: column; gap: 4px; }
+.election-bar .eb-k { font-size: 9px; color: var(--text-faint); letter-spacing: 0.22em; text-transform: uppercase; }
+.election-bar .eb-v { font-size: 14px; color: var(--text); letter-spacing: 0.04em; }
+.election-bar .eb-v .lead-tag { color: var(--green); font-weight: 600; transition: color 300ms; }
+.election-bar.electing .eb-v .lead-tag { color: var(--amber); }
+.election-bar .eb-right { font-size: 10px; color: var(--text-faint); letter-spacing: 0.18em; text-transform: uppercase; }
+
+.jm-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; position: relative; }
+.jm-row::before {
+  content: '';
+  position: absolute;
+  top: -14px; left: 16.66%; right: 16.66%;
+  height: 14px;
+  border-top: 1px dashed var(--border-2);
+  border-left: 1px dashed var(--border-2);
+  border-right: 1px dashed var(--border-2);
+  pointer-events: none;
+}
+.jm-pod {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  padding: 16px 18px 16px 32px;
+  position: relative;
+  display: flex; flex-direction: column; gap: 6px;
+  transition: border-color 300ms, background 300ms, opacity 300ms;
+}
+.jm-pod::before { content: ''; position: absolute; left: 12px; top: 18px; width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint); transition: background 300ms, box-shadow 300ms; }
+.jm-pod .jp-name { font-size: 13px; color: var(--text); font-weight: 600; letter-spacing: 0.04em; }
+.jm-pod .jp-role { font-size: 10px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--text-faint); }
+.jm-pod.leader { border-color: var(--green); background: rgba(61,220,132,0.07); }
+.jm-pod.leader::before { background: var(--green); box-shadow: 0 0 10px var(--green); }
+.jm-pod.leader .jp-role { color: var(--green); font-weight: 600; }
+.jm-pod.standby { opacity: 0.62; }
+.jm-pod.standby::before { background: var(--text-faint); }
+.jm-pod.dead { border-color: var(--red); background: var(--red-soft); opacity: 0.85; }
+.jm-pod.dead::before { background: var(--red); box-shadow: 0 0 10px var(--red); }
+.jm-pod.dead .jp-role { color: var(--red); font-weight: 600; }
+.jm-pod.dead .jp-name { text-decoration: line-through; text-decoration-color: var(--red); }
+
+.ha-bottom { display: grid; grid-template-columns: 1fr 1.8fr; gap: 18px; }
+
+.state-store {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  padding: 16px 18px 16px 32px;
+  position: relative;
+  display: flex; flex-direction: column; gap: 6px;
+  transition: border-color 300ms;
+}
+.state-store::before { content: ''; position: absolute; left: 12px; top: 50%; transform: translateY(-50%); width: 8px; height: 8px; background: var(--violet); transition: box-shadow 300ms; }
+.state-store.reading { border-color: var(--violet); }
+.state-store.reading::before { box-shadow: 0 0 12px var(--violet); animation: pulse 0.7s ease-in-out infinite; }
+.state-store .ss-k { font-size: 9px; color: var(--text-faint); letter-spacing: 0.22em; text-transform: uppercase; }
+.state-store .ss-v { font-size: 14px; color: var(--text); letter-spacing: 0.02em; font-weight: 600; }
+.state-store .ss-sub { font-size: 11px; color: var(--text-dim); line-height: 1.5; }
+
+.tm-pool {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  padding: 14px 18px;
+  display: flex; flex-direction: column; gap: 10px;
+  transition: border-color 300ms;
+}
+.tm-pool.reconnecting { border-color: var(--amber); }
+.tm-pool.stable { border-color: rgba(61,220,132,0.45); }
+.tm-pool-head { display: flex; justify-content: space-between; align-items: center; font-size: 10px; color: var(--text-faint); letter-spacing: 0.22em; text-transform: uppercase; }
+.tm-pool-head .v { color: var(--text-dim); letter-spacing: 0.06em; }
+.tm-pool-head .v .ok { color: var(--green); }
+.tm-pool-head .v .warn { color: var(--amber); }
+.tm-pool-grid { display: grid; grid-template-columns: repeat(20, 1fr); gap: 4px; }
+.tp-cell {
+  height: 16px;
+  background: rgba(61,220,132,0.08);
+  border: 1px solid rgba(61,220,132,0.45);
+  transition: background 200ms, border-color 200ms;
+}
+.tp-cell.warn { background: rgba(245,166,35,0.16); border-color: var(--amber); }
+
+.ha-status {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  padding: 14px 22px;
+  display: flex; align-items: center; gap: 18px;
+  transition: border-color 300ms;
+}
+.ha-status.crit { border-color: var(--red); }
+.ha-status.warn { border-color: var(--amber); }
+.ha-status.ok { border-color: rgba(61,220,132,0.45); }
+.ha-status .hs-tag { font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--cyan); padding: 3px 8px; border: 1px solid var(--cyan); flex-shrink: 0; }
+.ha-status.crit .hs-tag { color: var(--red); border-color: var(--red); }
+.ha-status.warn .hs-tag { color: var(--amber); border-color: var(--amber); }
+.ha-status.ok .hs-tag { color: var(--green); border-color: var(--green); }
+.ha-status .hs-msg { font-size: 13px; color: var(--text-dim); line-height: 1.5; }
+.ha-status .hs-msg .acc { color: var(--text); }
+.ha-status .hs-msg .grn { color: var(--green); font-weight: 600; }
+.ha-status .hs-msg .red { color: var(--red); font-weight: 600; }
+.ha-status .hs-msg .amb { color: var(--amber); font-weight: 600; }
+
+.ha-controls { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+
+/* ============= SLIDE 8: ROCKSDB TUNING ============= */
+.rdb { gap: 22px; }
+.rdb .head { display: flex; justify-content: space-between; align-items: flex-end; }
+.rdb .head .eyebrow { color: var(--cyan); }
+.rdb .head h2 { margin-top: 6px; max-width: 820px; }
+
+.rdb-config {
+  border: 1px solid var(--cyan);
+  background: rgba(103,232,249,0.06);
+  padding: 14px 22px 14px 36px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 24px;
+  position: relative;
+}
+.rdb-config::before { content: ''; position: absolute; left: 14px; top: 50%; transform: translateY(-50%); width: 8px; height: 8px; border-radius: 50%; background: var(--cyan); box-shadow: 0 0 10px var(--cyan); }
+.rdb-config .rc-k { font-size: 9px; color: var(--text-faint); letter-spacing: 0.22em; text-transform: uppercase; }
+.rdb-config .rc-v { font-size: 14px; color: var(--text); letter-spacing: 0.04em; font-family: 'IBM Plex Mono', monospace; }
+.rdb-config .rc-v .from { color: var(--red); text-decoration: line-through; text-decoration-color: var(--red); }
+.rdb-config .rc-v .to { color: var(--green); font-weight: 600; }
+.rdb-config .rc-right { font-size: 10px; color: var(--text-faint); letter-spacing: 0.18em; text-transform: uppercase; }
+
+.mem-stacks { display: flex; flex-direction: column; gap: 22px; }
+.mem-row { display: grid; grid-template-columns: 140px 1fr 120px; gap: 22px; align-items: center; }
+.mem-row .mem-label { display: flex; flex-direction: column; gap: 4px; }
+.mem-row .mem-label .lbl-k { font-size: 9px; color: var(--text-faint); letter-spacing: 0.22em; text-transform: uppercase; }
+.mem-row .mem-label .lbl-v { font-size: 16px; color: var(--text); font-weight: 600; letter-spacing: 0.02em; }
+.mem-row .mem-label .lbl-v.dim { color: var(--text-dim); }
+.mem-bar { position: relative; height: 44px; border: 1px solid var(--border-2); background: var(--bg-2); display: flex; overflow: hidden; }
+.mem-bar .seg { height: 100%; display: flex; align-items: center; justify-content: center; font-size: 10px; letter-spacing: 0.08em; font-weight: 600; color: var(--text); border-right: 1px solid rgba(10,11,13,0.7); text-transform: uppercase; transition: width 500ms cubic-bezier(.4,0,.2,1); }
+.mem-bar .seg:last-child { border-right: none; }
+.mem-bar .seg.rocksdb { background: rgba(255,77,79,0.22); color: var(--red); }
+.mem-bar .seg.jvm { background: rgba(167,139,250,0.22); color: var(--violet); }
+.mem-bar .seg.net { background: rgba(245,166,35,0.22); color: var(--amber); }
+.mem-bar .seg.saved { background: repeating-linear-gradient(45deg, rgba(61,220,132,0.18), rgba(61,220,132,0.18) 6px, rgba(61,220,132,0.06) 6px, rgba(61,220,132,0.06) 12px); color: var(--green); border-right: none; }
+.mem-bar .seg .seg-inner { display: flex; flex-direction: column; align-items: center; line-height: 1.15; }
+.mem-bar .seg .seg-name { font-size: 10px; }
+.mem-bar .seg .seg-val { font-size: 11px; opacity: 0.85; font-variant-numeric: tabular-nums; }
+.mem-row .mem-total { text-align: right; }
+.mem-row .mem-total .mt-k { font-size: 9px; color: var(--text-faint); letter-spacing: 0.22em; text-transform: uppercase; }
+.mem-row .mem-total .mt-v { font-size: 22px; font-weight: 700; color: var(--text); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+.mem-row .mem-total .mt-v .u { font-size: 12px; color: var(--text-faint); margin-left: 2px; font-weight: 500; }
+.mem-row.tuned .mem-total .mt-v { color: var(--green); }
+
+.rdb-impact {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+}
+.rdb-impact .ri-card {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  padding: 18px 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  position: relative;
+}
+.rdb-impact .ri-card::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 2px; background: var(--green); }
+.rdb-impact .ri-card .ri-k { font-size: 9px; color: var(--text-faint); letter-spacing: 0.22em; text-transform: uppercase; }
+.rdb-impact .ri-card .ri-v { font-size: 30px; font-weight: 700; color: var(--green); font-variant-numeric: tabular-nums; letter-spacing: -0.02em; line-height: 1; }
+.rdb-impact .ri-card .ri-v .u { font-size: 13px; color: var(--text-faint); margin-left: 4px; font-weight: 500; }
+.rdb-impact .ri-card .ri-note { font-size: 11px; color: var(--text-dim); line-height: 1.5; }
+
+/* ============= SLIDE 8: CLOSING ============= */
+.closing { align-items: center; justify-content: center; text-align: center; }
+.closing .inner { max-width: 1040px; }
+.closing .eyebrow { margin-bottom: 24px; }
+.closing h1.display { margin: 24px 0 32px 0; }
+.closing h1.display em { color: var(--green); }
+.closing .sub { font-size: 14px; color: var(--text-dim); letter-spacing: 0.02em; }
+.closing .stat-row { display: flex; justify-content: center; gap: 56px; margin-top: 32px; }
+.closing .stat { display: flex; flex-direction: column; gap: 6px; align-items: center; }
+.closing .stat .k { font-size: 10px; color: var(--text-faint); letter-spacing: 0.2em; text-transform: uppercase; }
+.closing .stat .v { font-size: 36px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.closing .stat .v .arrow { color: var(--text-faint); margin: 0 8px; font-size: 28px; }
+.closing .stat .v .b { color: var(--red); }
+.closing .stat .v .a { color: var(--green); }
+.closing .sign { margin-top: 64px; display: flex; justify-content: center; gap: 32px; font-size: 11px; letter-spacing: 0.2em; color: var(--text-faint); text-transform: uppercase; }
+.closing .sign .pipe { color: var(--border-2); }
+</style>
+</head>
+<body>
+  <div class="frame">
+    <main class="stage" id="stage">
+
+      <!-- SLIDE 1: TITLE -->
+      <section class="slide title" data-slide="1">
+        <div class="inner">
+          <div class="corner tl"></div><div class="corner tr"></div>
+          <div class="corner bl"></div><div class="corner br"></div>
+          <h1 class="display">making informed<br/>architectural <em>decisions</em></h1>
+        </div>
+      </section>
+
+      <!-- SLIDE 2: WHAT WE NOTICED -->
+      <section class="slide impact" data-slide="2">
+        <div class="grid">
+          <div class="lead">
+            <div class="eyebrow red">▸ what we noticed</div>
+            <h2 class="kill" style="margin-top:28px">the memory footprint<br/><span class="red">was increasing.</span></h2>
+            <p class="sub2">
+              we monitored the system and found that <span class="acc">memory footprint was huge</span> compared to the traffic we had.
+            </p>
+          </div>
+          <div class="facts">
+            <div class="fact">
+              <span class="k">risk · 01</span>
+              <span class="v red" style="font-size:18px">task manager evictions</span>
+              <span class="note">kubelet starts killing TM pods when the node runs out of memory headroom &mdash; work in flight is lost.</span>
+            </div>
+            <div class="fact amber">
+              <span class="k">risk · 02</span>
+              <span class="v amber" style="font-size:18px">job restart loop</span>
+              <span class="note">every eviction forces the JobManager to restart the whole job from the last checkpoint &mdash; reprocessing lag compounds.</span>
+            </div>
+            <div class="fact">
+              <span class="k">risk · 03</span>
+              <span class="v red" style="font-size:18px">cluster instability</span>
+              <span class="note">repeated evictions cascade across nodes. eventually the JobManager itself exits and the pipeline goes dark.</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SLIDE 3: ROOT CAUSE -->
+      <section class="slide rootcause" data-slide="3">
+        <div>
+          <div class="eyebrow">root cause &mdash; what we found</div>
+          <h2 class="section-title" style="margin-top:8px">each TaskManager was sized for <span class="acc">25 GiB</span>. it was actually using <span class="red">~28.5 GiB</span>.</h2>
+        </div>
+
+        <div class="rc-grid">
+          <div class="rc-card">
+            <span class="rc-k">memory ALLOCATED · per TM</span>
+            <span class="rc-v amber">25.0<span class="u">GiB</span></span>
+            <span class="rc-note">what we declared in the pod spec &mdash; the scheduler trusted this number when placing TMs on nodes.</span>
+          </div>
+          <div class="rc-card crit">
+            <span class="rc-k">memory ACTUAL · per TM</span>
+            <span class="rc-v red">~28.5<span class="u">GiB</span></span>
+            <span class="rc-note">what the JVM + state actually needed at peak load. <span class="acc">3.5 GiB more than the request &mdash; per pod.</span></span>
+          </div>
+        </div>
+
+      </section>
+
+      <!-- SLIDE 4: CLUSTER DIAGRAM -->
+      <section class="slide cluster" data-slide="4">
+        <div class="head-row">
+          <div class="lead">
+            <div class="eyebrow">act ii · the cascade</div>
+          </div>
+        </div>
+
+        <div class="cluster-diagram">
+          <div class="jm-box" id="jm-box">
+            <div class="col">
+              <span class="col-label">JobManager · stateful</span>
+              <span class="col-value">flink-jm-codi-0</span>
+            </div>
+            <div class="col jm-status">
+              <span class="col-label">status</span>
+              <span class="col-value" id="jm-status">ACTIVE</span>
+            </div>
+            <div class="col jm-counter">
+              <span class="col-label">restart attempts</span>
+              <span class="col-value"><span id="restart-counter">0</span><span class="total">/ 20</span></span>
+            </div>
+          </div>
+
+          <div class="trunk">
+            <div class="trunk-line"></div>
+          </div>
+
+          <div class="tm-cluster" id="tm-cluster">
+            <div class="tm-grid" id="tm-grid"></div>
+          </div>
+        </div>
+
+        <div class="event-log" id="event-log">
+          <span class="el-msg" id="event-msg">cluster healthy &mdash; all 50 TaskManagers running, job processing normally.</span>
+        </div>
+
+        <div class="cluster-controls">
+          <div class="step-pips" id="step-pips"></div>
+          <button class="replay-btn" id="replay-btn">⟲ replay</button>
+        </div>
+      </section>
+
+      <!-- SLIDE 5: FIX -->
+      <section class="slide fix" data-slide="5">
+        <div>
+          <div class="eyebrow green">fix applied</div>
+          <h2 class="section-title" style="margin-top:8px">three changes &mdash; <span class="grn">stop stacking, raise requests, drop log volume.</span></h2>
+        </div>
+        <div class="cards">
+          <div class="fix-card">
+            <div class="ix">FIX 01 · scheduler</div>
+            <h3>TaskManager count</h3>
+            <div class="change"><span class="from">50</span><span class="arrow">→</span><span class="to">40</span></div>
+            <div class="desc"><span class="acc">reduces cluster-wide memory pressure</span> and stops the scheduler from stacking 4 TMs onto a single node.</div>
+          </div>
+          <div class="fix-card">
+            <div class="ix">FIX 02 · resources</div>
+            <h3>memory request</h3>
+            <div class="change"><span class="from">25<span class="u">GiB</span></span><span class="arrow">→</span><span class="to">30<span class="u">GiB</span></span></div>
+            <div class="desc"><span class="acc">requests now exceed real usage.</span> scheduler no longer overcommits the node; limit unchanged at 35 GiB.</div>
+          </div>
+          <div class="fix-card">
+            <div class="ix">FIX 03 · observability</div>
+            <h3>log levels</h3>
+            <div class="change"><span class="from">DEBUG</span><span class="arrow">→</span><span class="to">INFO + WARN</span></div>
+            <div class="desc"><span class="acc">reduces log volume, GC pressure,</span> and the noise that was masking real signals.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SLIDE 6: RESULT -->
+      <section class="slide result" data-slide="6">
+        <div>
+          <div class="eyebrow green">results &mdash; post-fix</div>
+        </div>
+        <div class="grid" style="grid-template-columns: 1fr; max-width: 720px; margin: 0 auto; width: 100%;">
+          <div class="col after">
+            <div class="col-head"><span class="t">post-fix · live cluster</span></div>
+            <div class="metric"><span class="k">TM count</span><span class="v">40</span></div>
+            <div class="metric"><span class="k">request / TM</span><span class="v">30<span class="u">GiB</span></span></div>
+            <div class="metric"><span class="k">peak TM memory <span style="color:var(--text-faint);font-size:9px">(tm-18)</span></span><span class="v">18.3<span class="u">GiB</span></span></div>
+            <div class="metric"><span class="k">avg TM memory · 40 pods</span><span class="v">~11<span class="u">GiB</span></span></div>
+            <div class="metric"><span class="k">% of limit · peak / avg</span><span class="v">52 / 31<span class="u">%</span></span></div>
+            <div class="metric"><span class="k">node headroom</span><span class="v">~14<span class="u">GiB</span></span></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SLIDE 7: HA ARCHITECTURE -->
+      <section class="slide ha" data-slide="7">
+        <div class="head">
+          <div>
+            <div class="eyebrow cyan">future optimizations</div>
+            <h2 class="section-title" style="margin-top:6px">jobmanager HA &mdash; <span style="color:var(--cyan)">eliminate the single point of failure.</span></h2>
+          </div>
+        </div>
+
+        <div class="ha-arch">
+          <div class="election-bar" id="election-bar">
+            <div class="eb-left">
+              <span class="eb-k">leader election &middot; kubernetes ConfigMap</span>
+              <span class="eb-v">flink-codi-leader &nbsp;&middot;&nbsp; current_leader = <span class="lead-tag" id="leader-tag">jm-0</span></span>
+            </div>
+            <div class="eb-right">k8s-native HA</div>
+          </div>
+
+          <div class="jm-row">
+            <div class="jm-pod leader" id="jm-pod-0">
+              <span class="jp-name">flink-jm-codi-0</span>
+              <span class="jp-role">LEADER &middot; active</span>
+            </div>
+            <div class="jm-pod standby" id="jm-pod-1">
+              <span class="jp-name">flink-jm-codi-1</span>
+              <span class="jp-role">STANDBY</span>
+            </div>
+            <div class="jm-pod standby" id="jm-pod-2">
+              <span class="jp-name">flink-jm-codi-2</span>
+              <span class="jp-role">STANDBY</span>
+            </div>
+          </div>
+
+          <div class="tm-pool" id="tm-pool">
+            <div class="tm-pool-head">
+              <span>taskmanager pool</span>
+              <span class="v"><span id="tp-connected" class="ok">40 / 40</span> registered with leader</span>
+            </div>
+            <div class="tm-pool-grid" id="tm-pool-grid"></div>
+          </div>
+
+          <div class="ha-status" id="ha-status">
+            <span class="hs-tag" id="hs-tag">STEADY STATE</span>
+            <span class="hs-msg" id="hs-msg">3 JMs running. <span class="grn">jm-0</span> holds the lease, jm-1 / jm-2 watch the ConfigMap. job processing normally.</span>
+          </div>
+        </div>
+
+        <div class="ha-controls">
+          <div class="step-pips" id="ha-step-pips"></div>
+          <button class="replay-btn" id="ha-replay-btn">⟲ replay failover</button>
+        </div>
+      </section>
+
+      <!-- SLIDE 8: ROCKSDB MEMORY TUNING -->
+      <section class="slide rdb" data-slide="8">
+        <div class="head">
+          <div>
+            <div class="eyebrow cyan">future optimizations &middot; 02</div>
+            <h2 class="section-title" style="margin-top:6px">right-size the rocksdb block cache &mdash; <span style="color:var(--green)">reclaim 7 GiB per TM.</span></h2>
+          </div>
+        </div>
+
+        <div class="rdb-config">
+          <div class="rc-left" style="display:flex; flex-direction:column; gap:4px">
+            <span class="rc-k">flink config &middot; state.backend.rocksdb.memory.fixed-per-slot</span>
+            <span class="rc-v"><span class="from">8 GiB</span> &nbsp;&rarr;&nbsp; <span class="to">1 GiB</span></span>
+          </div>
+          <div class="rc-right">per-TM tuning knob</div>
+        </div>
+
+        <div class="mem-stacks">
+          <div class="mem-row current">
+            <div class="mem-label">
+              <span class="lbl-k">current &middot; per TM</span>
+              <span class="lbl-v dim">avg ~11 GiB</span>
+            </div>
+            <div class="mem-bar">
+              <div class="seg rocksdb" style="width:66.7%"><div class="seg-inner"><span class="seg-name">rocksdb block cache</span><span class="seg-val">8.0 GiB</span></div></div>
+              <div class="seg jvm" style="width:16.7%"><div class="seg-inner"><span class="seg-name">jvm heap</span><span class="seg-val">2.0</span></div></div>
+              <div class="seg net" style="width:8.3%"><div class="seg-inner"><span class="seg-name">net + mgd</span><span class="seg-val">1.0</span></div></div>
+            </div>
+            <div class="mem-total">
+              <div class="mt-k">total used</div>
+              <div class="mt-v">11<span class="u">GiB</span></div>
+            </div>
+          </div>
+
+          <div class="mem-row tuned">
+            <div class="mem-label">
+              <span class="lbl-k">tuned &middot; per TM</span>
+              <span class="lbl-v">projected ~4 GiB</span>
+            </div>
+            <div class="mem-bar">
+              <div class="seg rocksdb" style="width:8.3%"><div class="seg-inner"><span class="seg-name">rdb</span><span class="seg-val">1.0</span></div></div>
+              <div class="seg jvm" style="width:16.7%"><div class="seg-inner"><span class="seg-name">jvm heap</span><span class="seg-val">2.0</span></div></div>
+              <div class="seg net" style="width:8.3%"><div class="seg-inner"><span class="seg-name">net + mgd</span><span class="seg-val">1.0</span></div></div>
+              <div class="seg saved" style="width:58.3%"><div class="seg-inner"><span class="seg-name">reclaimed</span><span class="seg-val">&minus;7.0 GiB</span></div></div>
+            </div>
+            <div class="mem-total">
+              <div class="mt-k">total used</div>
+              <div class="mt-v">4<span class="u">GiB</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="rdb-impact" style="grid-template-columns: repeat(2, 1fr)">
+          <div class="ri-card">
+            <span class="ri-k">per TM &middot; memory saved</span>
+            <span class="ri-v">&minus;7<span class="u">GiB</span></span>
+            <span class="ri-note">collapses the block cache. JVM heap + network buffers untouched. checkpoint behavior unchanged.</span>
+          </div>
+          <div class="ri-card">
+            <span class="ri-k">cluster-wide &middot; 40 TMs</span>
+            <span class="ri-v">&minus;280<span class="u">GiB</span></span>
+            <span class="ri-note">7 GiB &times; 40 pods. enough headroom to drop nodes, run more workloads, or absorb traffic spikes without re-tuning.</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- SLIDE 9: CLOSING -->
+      <section class="slide closing" data-slide="9">
+        <div class="inner">
+          <h1 class="display">thank <em>you.</em></h1>
+        </div>
+      </section>
+
+    </main>
+
+    <footer class="hud-bottom">
+      <div class="progress"><div class="progress-fill" id="pfill" style="width:11.11%"></div></div>
+      <div class="counter"><span id="cur">01</span> / <span id="tot">09</span></div>
+      <div class="hint">
+        <span><kbd>←</kbd><kbd>→</kbd>navigate</span>
+        <span><kbd>R</kbd>replay</span>
+        <span><kbd>1-9</kbd>jump</span>
+      </div>
+    </footer>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/animejs@3.2.1/lib/anime.min.js"></script>
+  <script>
+  /* ============= CONTROLLER ============= */
+  const TOTAL = 9;
+  let cur = 1;
+  let clusterStepIdx = 0;
+  let haStepIdx = 0;
+
+  const slides = document.querySelectorAll('.slide');
+  const curEl = document.getElementById('cur');
+  const pfill = document.getElementById('pfill');
+
+  function show(n) {
+    cur = n;
+    slides.forEach(s => s.classList.toggle('active', parseInt(s.dataset.slide) === n));
+    curEl.textContent = String(n).padStart(2, '0');
+    pfill.style.width = (n / TOTAL * 100) + '%';
+
+    if (n === 4) {
+      resetCluster();
+      clusterStepIdx = 0;
+      updatePips();
+    }
+    if (n === 7) {
+      resetHA();
+      haStepIdx = 0;
+      updateHAPips();
+    }
+  }
+
+  function advance() {
+    if (cur === 4 && clusterStepIdx < clusterSteps.length) {
+      clusterSteps[clusterStepIdx]();
+      clusterStepIdx++;
+      updatePips();
+      return;
+    }
+    if (cur === 7 && haStepIdx < haSteps.length) {
+      haSteps[haStepIdx]();
+      haStepIdx++;
+      updateHAPips();
+      return;
+    }
+    if (cur < TOTAL) show(cur + 1);
+  }
+  function back() {
+    if (cur > 1) show(cur - 1);
+  }
+  function replay() {
+    if (cur === 4) { resetCluster(); clusterStepIdx = 0; updatePips(); }
+    if (cur === 7) { resetHA(); haStepIdx = 0; updateHAPips(); }
+  }
+
+  document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowRight') { e.preventDefault(); advance(); }
+    else if (e.key === 'ArrowLeft') { e.preventDefault(); back(); }
+    else if (e.key === 'r' || e.key === 'R') { e.preventDefault(); replay(); }
+    else if (e.key === 'Escape') { show(1); }
+    else if (e.key >= '1' && e.key <= '9') { show(parseInt(e.key)); }
+  });
+
+  document.getElementById('replay-btn').addEventListener('click', e => {
+    e.stopPropagation();
+    resetCluster();
+    clusterStepIdx = 0;
+    updatePips();
+  });
+
+  document.getElementById('ha-replay-btn').addEventListener('click', e => {
+    e.stopPropagation();
+    resetHA();
+    haStepIdx = 0;
+    updateHAPips();
+  });
+
+  /* ============= SLIDE 3: CLUSTER ============= */
+  const TM_COUNT = 50;
+  const FLAGGED = [17, 18, 28, 49];
+
+  (function buildCluster() {
+    const grid = document.getElementById('tm-grid');
+    grid.innerHTML = '';
+    for (let i = 1; i <= TM_COUNT; i++) {
+      const cell = document.createElement('div');
+      cell.className = 'tm-cell healthy';
+      cell.id = 'tm-' + i;
+      cell.textContent = 'TM-' + String(i).padStart(2, '0');
+      if (FLAGGED.includes(i)) cell.classList.add('flagged');
+      grid.appendChild(cell);
+    }
+  })();
+
+  function setEvent(html, modifier) {
+    document.getElementById('event-msg').innerHTML = html;
+    const log = document.getElementById('event-log');
+    log.classList.remove('crit', 'healthy');
+    if (modifier) log.classList.add(modifier);
+  }
+
+  function evictTM(num) {
+    const cell = document.getElementById('tm-' + num);
+    if (!cell) return;
+    cell.classList.remove('healthy', 'restarting');
+    cell.classList.add('evicted');
+    cell.textContent = 'TM-' + String(num).padStart(2, '0');
+  }
+
+  function restartCascadeWave() {
+    // Staggered wave: each healthy cell flashes amber for ~500ms in sequence
+    const cells = Array.from(document.querySelectorAll('.tm-cell.healthy'));
+    cells.forEach((c, i) => {
+      setTimeout(() => {
+        c.classList.remove('healthy');
+        c.classList.add('restarting');
+      }, i * 14);
+      setTimeout(() => {
+        c.classList.remove('restarting');
+        c.classList.add('healthy');
+      }, i * 14 + 480);
+    });
+  }
+
+  function updateTMCount() { /* counter element removed; no-op */ }
+
+  function tweenRestartCounter(to, duration = 700) {
+    const from = parseInt(document.getElementById('restart-counter').textContent) || 0;
+    const obj = { v: from };
+    anime({
+      targets: obj,
+      v: to,
+      duration,
+      easing: 'easeOutCubic',
+      round: 1,
+      update: () => { document.getElementById('restart-counter').textContent = obj.v; }
+    });
+  }
+
+  function resetCluster() {
+    anime.remove('#restart-counter');
+    for (let i = 1; i <= TM_COUNT; i++) {
+      const c = document.getElementById('tm-' + i);
+      anime.remove(c);
+      c.className = 'tm-cell healthy';
+      if (FLAGGED.includes(i)) c.classList.add('flagged');
+      c.textContent = 'TM-' + String(i).padStart(2, '0');
+      c.style.transform = '';
+      c.style.opacity = '';
+    }
+    document.getElementById('restart-counter').textContent = '0';
+    document.getElementById('jm-status').textContent = 'ACTIVE';
+    document.getElementById('jm-box').classList.remove('failing', 'recovery');
+    setEvent('cluster healthy &mdash; all 50 TaskManagers running, job processing normally.', 'healthy');
+  }
+
+  const clusterSteps = [
+    // Step 1 — TM-18 evicted (shake + fly off the grid). JM marks the loss.
+    () => {
+      setEvent('kubelet evicts <span class="red">TM-18</span> &mdash; node was low on resource: memory. JM logs <span class="amber">RemoteTransportException</span>: lost connection to TM-18.', 'crit');
+      const tm18 = document.getElementById('tm-18');
+      document.getElementById('tm-cluster').classList.add('flash');
+      const jm = document.getElementById('jm-box');
+      jm.classList.remove('failing');
+      jm.classList.add('recovery');
+      document.getElementById('jm-status').textContent = 'TM LOST';
+      anime.remove(tm18);
+      tm18.classList.remove('healthy');
+      tm18.classList.add('evicted');
+      anime({
+        targets: tm18,
+        translateX: [
+          { value: -5, duration: 60 },
+          { value: 5, duration: 60 },
+          { value: -4, duration: 60 },
+          { value: 4, duration: 60 },
+          { value: 0, duration: 60 }
+        ],
+        easing: 'easeInOutSine'
+      });
+      setTimeout(() => {
+        anime({
+          targets: tm18,
+          translateY: [0, 64],
+          opacity: [1, 0],
+          duration: 600,
+          easing: 'easeInQuad'
+        });
+        document.getElementById('tm-cluster').classList.remove('flash');
+      }, 380);
+    },
+    // Step 2 — kubernetes schedules a new TM-18 pod; it drops in and registers
+    () => {
+      setEvent('kubernetes notices the missing replica → <span class="acc">schedules a new TM-18 pod</span> on a fresh node. it registers back with the JM.', 'crit');
+      document.getElementById('jm-status').textContent = 'AWAITING SLOTS';
+      const tm18 = document.getElementById('tm-18');
+      anime.remove(tm18);
+      tm18.classList.remove('evicted', 'gone', 'healthy');
+      tm18.classList.add('restarting');
+      tm18.style.opacity = '0';
+      tm18.style.transform = 'translateY(-50px) scale(0.6)';
+      anime({
+        targets: tm18,
+        translateY: [-50, 0],
+        opacity: [0, 1],
+        scale: [0.6, 1],
+        duration: 650,
+        easing: 'easeOutBack',
+        complete: () => {
+          tm18.style.transform = '';
+          tm18.style.opacity = '';
+        }
+      });
+    },
+    // Step 3 — JM has all 50 slots → restart the whole job from checkpoint
+    () => {
+      setEvent('JM has all 50 slots again → <span class="acc">restarts the entire job from the last checkpoint.</span> every TM cycles through cancel-restart. cluster stable.', 'healthy');
+      const jm = document.getElementById('jm-box');
+      jm.classList.remove('failing', 'recovery');
+      document.getElementById('jm-status').textContent = 'ACTIVE';
+      tweenRestartCounter(1, 700);
+      const tm18 = document.getElementById('tm-18');
+      tm18.classList.remove('restarting');
+      tm18.classList.add('healthy');
+      setTimeout(() => restartCascadeWave(), 150);
+    }
+  ];
+
+  function updatePips() {
+    const pipsEl = document.getElementById('step-pips');
+    pipsEl.innerHTML = '';
+    for (let i = 0; i < clusterSteps.length; i++) {
+      const pip = document.createElement('div');
+      pip.className = 'pip';
+      if (i < clusterStepIdx) pip.classList.add('done');
+      if (i === clusterStepIdx - 1) pip.classList.add('current');
+      pipsEl.appendChild(pip);
+    }
+  }
+
+  /* ============= SLIDE 6: COUNTER TWEEN ============= */
+  let resultObj = null;
+  function playResultCounter() {
+    if (resultObj) anime.remove(resultObj);
+    const after = document.getElementById('result-after-ev');
+    after.textContent = '4';
+    setTimeout(() => {
+      resultObj = { v: 4 };
+      anime({
+        targets: resultObj,
+        v: 0,
+        duration: 1300,
+        easing: 'easeOutCubic',
+        round: 1,
+        update: () => { after.textContent = resultObj.v; }
+      });
+    }, 300);
+  }
+
+  /* ============= SLIDE 7: HA ARCHITECTURE ============= */
+  const TM_POOL_COUNT = 40;
+
+  (function buildTMPool() {
+    const grid = document.getElementById('tm-pool-grid');
+    grid.innerHTML = '';
+    for (let i = 0; i < TM_POOL_COUNT; i++) {
+      const c = document.createElement('div');
+      c.className = 'tp-cell';
+      grid.appendChild(c);
+    }
+  })();
+
+  function setHAStatus(tagText, html, modifier) {
+    document.getElementById('hs-tag').textContent = tagText;
+    document.getElementById('hs-msg').innerHTML = html;
+    const s = document.getElementById('ha-status');
+    s.classList.remove('crit', 'warn', 'ok');
+    if (modifier) s.classList.add(modifier);
+  }
+
+  function resetHA() {
+    const pod0 = document.getElementById('jm-pod-0');
+    const pod1 = document.getElementById('jm-pod-1');
+    const pod2 = document.getElementById('jm-pod-2');
+    [pod0, pod1, pod2].forEach(p => p.classList.remove('leader', 'standby', 'dead'));
+    pod0.classList.add('leader');
+    pod0.querySelector('.jp-role').textContent = 'LEADER · active';
+    pod1.classList.add('standby');
+    pod1.querySelector('.jp-role').textContent = 'STANDBY';
+    pod2.classList.add('standby');
+    pod2.querySelector('.jp-role').textContent = 'STANDBY';
+
+    const eb = document.getElementById('election-bar');
+    eb.classList.remove('electing');
+    document.getElementById('leader-tag').textContent = 'jm-0';
+    document.getElementById('leader-tag').style.color = '';
+
+    const pool = document.getElementById('tm-pool');
+    pool.classList.remove('reconnecting', 'stable');
+    document.querySelectorAll('.tp-cell').forEach(c => c.classList.remove('warn'));
+    document.getElementById('tp-connected').innerHTML = '<span class="ok">40 / 40</span>';
+
+    setHAStatus('STEADY STATE',
+      '3 JMs running. <span class="grn">jm-0</span> holds the lease, jm-1 / jm-2 watch the ConfigMap. job processing normally.',
+      'ok');
+  }
+
+  const haSteps = [
+    // Step 1 — leader dies, election begins
+    () => {
+      const pod0 = document.getElementById('jm-pod-0');
+      pod0.classList.remove('leader');
+      pod0.classList.add('dead');
+      pod0.querySelector('.jp-role').textContent = 'CRASHED';
+
+      const eb = document.getElementById('election-bar');
+      eb.classList.add('electing');
+      document.getElementById('leader-tag').textContent = '— electing —';
+
+      const pool = document.getElementById('tm-pool');
+      pool.classList.add('reconnecting');
+      document.querySelectorAll('.tp-cell').forEach(c => c.classList.add('warn'));
+      document.getElementById('tp-connected').innerHTML = '<span class="warn">0 / 40</span>';
+
+      setHAStatus('LEADER LOST',
+        '<span class="red">jm-0 crashed.</span> kubernetes ConfigMap lease expires &mdash; standbys race for the lock.',
+        'crit');
+    },
+    // Step 2 — standby promoted, reads state from S3
+    () => {
+      const pod1 = document.getElementById('jm-pod-1');
+      pod1.classList.remove('standby');
+      pod1.classList.add('leader');
+      pod1.querySelector('.jp-role').textContent = 'LEADER · active';
+
+      const eb = document.getElementById('election-bar');
+      eb.classList.remove('electing');
+      document.getElementById('leader-tag').textContent = 'jm-1';
+
+      setHAStatus('FAILING OVER',
+        '<span class="grn">jm-1</span> wins the lease. rebuilds execution graph from the last checkpoint &mdash; TMs prepare to reconnect.',
+        'warn');
+    },
+    // Step 3 — TMs reconnect, job resumes
+    () => {
+      const pool = document.getElementById('tm-pool');
+      pool.classList.remove('reconnecting');
+      pool.classList.add('stable');
+
+      const cells = Array.from(document.querySelectorAll('.tp-cell'));
+      cells.forEach((c, i) => {
+        setTimeout(() => c.classList.remove('warn'), i * 18);
+      });
+      document.getElementById('tp-connected').innerHTML = '<span class="ok">40 / 40</span>';
+
+      setHAStatus('RECOVERED',
+        '40 TMs reconnect to <span class="grn">jm-1</span>. job resumes from the last checkpoint. <span class="grn">no manual intervention.</span>',
+        'ok');
+    }
+  ];
+
+  function updateHAPips() {
+    const pipsEl = document.getElementById('ha-step-pips');
+    pipsEl.innerHTML = '';
+    for (let i = 0; i < haSteps.length; i++) {
+      const pip = document.createElement('div');
+      pip.className = 'pip';
+      if (i < haStepIdx) pip.classList.add('done');
+      if (i === haStepIdx - 1) pip.classList.add('current');
+      pipsEl.appendChild(pip);
+    }
+  }
+
+  // boot
+  show(1);
+  updatePips();
+  updateHAPips();
+  </script>
+</body>
+</html>
